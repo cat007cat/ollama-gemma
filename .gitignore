@@ -1,0 +1,13 @@
+.DS_Store
+.vscode
+.env
+.venv
+.swp
+dist
+ollama
+ggml-metal.metal
+.cache
+*.exe
+.idea
+test_data
+*.crt
