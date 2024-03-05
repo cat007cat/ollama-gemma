@@ -25,6 +25,7 @@ import (
 type handles struct {
 	cuda *C.cuda_handle_t
 	rocm *C.rocm_handle_t
+	oneapi *C.oneapi_handle_t
 }
 
 var gpuMutex sync.Mutex
@@ -62,16 +63,23 @@ var RocmWindowsGlobs = []string{
 	"c:\\Windows\\System32\\rocm_smi64.dll",
 }
 
+var OneapiLinuxGlobs = []string{
+	"/usr/lib/x86_64-linux-gnu/libze_intel_gpu.so*",
+	"/usr/lib*/libze_intel_gpu.so*",
+}
+
 // Note: gpuMutex must already be held
 func initGPUHandles() {
 
 	// TODO - if the ollama build is CPU only, don't do these checks as they're irrelevant and confusing
 
-	gpuHandles = &handles{nil, nil}
+	gpuHandles = &handles{nil, nil, nil}
 	var cudaMgmtName string
 	var cudaMgmtPatterns []string
 	var rocmMgmtName string
 	var rocmMgmtPatterns []string
+	var oneapiMgmtName string
+	var oneapiMgmtPatterns []string
 	switch runtime.GOOS {
 	case "windows":
 		cudaMgmtName = "nvml.dll"
@@ -87,6 +95,9 @@ func initGPUHandles() {
 		rocmMgmtName = "librocm_smi64.so"
 		rocmMgmtPatterns = make([]string, len(RocmLinuxGlobs))
 		copy(rocmMgmtPatterns, RocmLinuxGlobs)
+		oneapiMgmtName = "libze_intel_gpu.so"
+		oneapiMgmtPatterns = make([]string, len(OneapiLinuxGlobs))
+		copy(oneapiMgmtPatterns, OneapiLinuxGlobs)
 	default:
 		return
 	}
@@ -108,6 +119,16 @@ func initGPUHandles() {
 		if rocm != nil {
 			slog.Info("Radeon GPU detected")
 			gpuHandles.rocm = rocm
+			return
+		}
+	}
+
+	oneapiLibPaths := FindGPULibs(oneapiMgmtName, oneapiMgmtPatterns)
+	if len(oneapiLibPaths) > 0 {
+		oneapi := LoadOneapiMgmt(oneapiLibPaths)
+		if oneapi != nil {
+			slog.Info("Intel GPU detected")
+			gpuHandles.oneapi = oneapi
 			return
 		}
 	}
@@ -149,66 +170,61 @@ func GetGPUInfo() GpuInfo {
 				slog.Info(fmt.Sprintf("CUDA GPU is too old. Falling back to CPU mode. Compute Capability detected: %d.%d", cc.major, cc.minor))
 			}
 		}
-	} else if AMDDetected() && gpuHandles.rocm != nil && (cpuVariant != "" || runtime.GOARCH != "amd64") {
-		ver, err := AMDDriverVersion()
-		if err == nil {
-			slog.Info("AMD Driver: " + ver)
-		} else {
-			// For now this is benign, but we may eventually need to fail compatibility checks
-			slog.Debug("error looking up amd driver version: %s", err)
-		}
-		gfx := AMDGFXVersions()
-		tooOld := false
-		for _, v := range gfx {
-			if v.Major < 9 {
-				slog.Info("AMD GPU too old, falling back to CPU " + v.ToGFXString())
-				tooOld = true
-				break
-			}
-
-			// TODO - remap gfx strings for unsupporetd minor/patch versions to supported for the same major
-			// e.g. gfx1034 works if we map it to gfx1030 at runtime
-
-		}
-		if !tooOld {
-			// TODO - this algo can be shifted over to use sysfs instead of the rocm info library...
-			C.rocm_check_vram(*gpuHandles.rocm, &memInfo)
-			if memInfo.err != nil {
-				slog.Info(fmt.Sprintf("error looking up ROCm GPU memory: %s", C.GoString(memInfo.err)))
-				C.free(unsafe.Pointer(memInfo.err))
-			} else if memInfo.igpu_index >= 0 && memInfo.count == 1 {
-				// Only one GPU detected and it appears to be an integrated GPU - skip it
-				slog.Info("ROCm unsupported integrated GPU detected")
-			} else if memInfo.count > 0 {
-				if memInfo.igpu_index >= 0 {
-					// We have multiple GPUs reported, and one of them is an integrated GPU
-					// so we have to set the env var to bypass it
-					// If the user has specified their own ROCR_VISIBLE_DEVICES, don't clobber it
-					val := os.Getenv("ROCR_VISIBLE_DEVICES")
-					if val == "" {
-						devices := []string{}
-						for i := 0; i < int(memInfo.count); i++ {
-							if i == int(memInfo.igpu_index) {
-								continue
-							}
-							devices = append(devices, strconv.Itoa(i))
+	} else if gpuHandles.rocm != nil && (cpuVariant != "" || runtime.GOARCH != "amd64") {
+		C.rocm_check_vram(*gpuHandles.rocm, &memInfo)
+		if memInfo.err != nil {
+			slog.Info(fmt.Sprintf("error looking up ROCm GPU memory: %s", C.GoString(memInfo.err)))
+			C.free(unsafe.Pointer(memInfo.err))
+		} else if memInfo.igpu_index >= 0 && memInfo.count == 1 {
+			// Only one GPU detected and it appears to be an integrated GPU - skip it
+			slog.Info("ROCm unsupported integrated GPU detected")
+		} else if memInfo.count > 0 {
+			if memInfo.igpu_index >= 0 {
+				// We have multiple GPUs reported, and one of them is an integrated GPU
+				// so we have to set the env var to bypass it
+				// If the user has specified their own ROCR_VISIBLE_DEVICES, don't clobber it
+				val := os.Getenv("ROCR_VISIBLE_DEVICES")
+				if val == "" {
+					devices := []string{}
+					for i := 0; i < int(memInfo.count); i++ {
+						if i == int(memInfo.igpu_index) {
+							continue
 						}
-						val = strings.Join(devices, ",")
-						os.Setenv("ROCR_VISIBLE_DEVICES", val)
+						devices = append(devices, strconv.Itoa(i))
 					}
-					slog.Info(fmt.Sprintf("ROCm integrated GPU detected - ROCR_VISIBLE_DEVICES=%s", val))
+					val = strings.Join(devices, ",")
+					os.Setenv("ROCR_VISIBLE_DEVICES", val)
 				}
-				resp.Library = "rocm"
-				var version C.rocm_version_resp_t
-				C.rocm_get_version(*gpuHandles.rocm, &version)
-				verString := C.GoString(version.str)
-				if version.status == 0 {
-					resp.Variant = "v" + verString
-				} else {
-					slog.Info(fmt.Sprintf("failed to look up ROCm version: %s", verString))
-				}
-				C.free(unsafe.Pointer(version.str))
+				slog.Info(fmt.Sprintf("ROCm integrated GPU detected - ROCR_VISIBLE_DEVICES=%s", val))
 			}
+			resp.Library = "rocm"
+			var version C.rocm_version_resp_t
+			C.rocm_get_version(*gpuHandles.rocm, &version)
+			verString := C.GoString(version.str)
+			if version.status == 0 {
+				resp.Variant = "v" + verString
+			} else {
+				slog.Info(fmt.Sprintf("failed to look up ROCm version: %s", verString))
+			}
+			C.free(unsafe.Pointer(version.str))
+		}
+	} else if gpuHandles.oneapi != nil && (cpuVariant != "" || runtime.GOARCH != "amd64") {
+		C.oneapi_check_vram(*gpuHandles.oneapi, &memInfo)
+		if memInfo.err != nil {
+			slog.Info(fmt.Sprintf("error looking up OneAPI GPU memory: %s", C.GoString(memInfo.err)))
+			C.free(unsafe.Pointer(memInfo.err))
+		} else if memInfo.igpu_index >= 0 && memInfo.count == 1 {
+			// Only one GPU detected and it appears to be an integrated GPU - skip it
+			slog.Info("OneAPI unsupported integrated GPU detected")
+		} else if memInfo.count > 0 {
+			if memInfo.igpu_index >= 0 {
+				// We have multiple GPUs reported, and one of them is an integrated GPU
+				// so we have to set the env var to bypass it
+				// If the user has specified their own ROCR_VISIBLE_DEVICES, don't clobber it
+
+				// TODO
+			}
+			resp.Library = "oneapi"
 		}
 	}
 	if resp.Library == "" {
@@ -243,7 +259,7 @@ func getCPUMem() (memInfo, error) {
 
 func CheckVRAM() (int64, error) {
 	gpuInfo := GetGPUInfo()
-	if gpuInfo.FreeMemory > 0 && (gpuInfo.Library == "cuda" || gpuInfo.Library == "rocm") {
+	if gpuInfo.FreeMemory > 0 && (gpuInfo.Library == "cuda" || gpuInfo.Library == "rocm" || gpuInfo.Library == "oneapi") {
 		// leave 10% or 1024MiB of VRAM free per GPU to handle unaccounted for overhead
 		overhead := gpuInfo.FreeMemory / 10
 		gpus := uint64(gpuInfo.DeviceCount)
@@ -341,6 +357,23 @@ func LoadROCMMgmt(rocmLibPaths []string) *C.rocm_handle_t {
 			C.free(unsafe.Pointer(resp.err))
 		} else {
 			return &resp.rh
+		}
+	}
+	return nil
+}
+
+func LoadOneapiMgmt(rocmLibPaths []string) *C.oneapi_handle_t {
+	var resp C.oneapi_init_resp_t
+	resp.oh.verbose = getVerboseState()
+	for _, libPath := range rocmLibPaths {
+		lib := C.CString(libPath)
+		defer C.free(unsafe.Pointer(lib))
+		C.oneapi_init(lib, &resp)
+		if resp.err != nil {
+			slog.Info(fmt.Sprintf("Unable to load oneAPI management library %s: %s", libPath, C.GoString(resp.err)))
+			C.free(unsafe.Pointer(resp.err))
+		} else {
+			return &resp.oh
 		}
 	}
 	return nil
