@@ -21,6 +21,7 @@ amdGPUs() {
         return
     fi
     GPU_LIST=(
+        "gfx803"
         "gfx900"
         "gfx906:xnack-"
         "gfx908:xnack-"
@@ -192,7 +193,6 @@ if [ -d "${ROCM_PATH}" ]; then
     #       them being present at runtime on the host
     compress_libs
 fi
-
 
 if [ -d "${ONEAPI_ROOT}" ]; then
     echo "OneAPI libraries detected - building dynamic OneAPI library"
